@@ -11,6 +11,14 @@ import pandas as pd
 import json
 
 
+def is_artifact_column(col: str) -> bool:
+    return col == "index" or col.startswith("Unnamed")
+
+
+def feature_columns(df: pd.DataFrame) -> list[str]:
+    return [c for c in df.columns if c != "eid" and not is_artifact_column(c)]
+
+
 def prepare_full_structured_data(
     augmented_dir: str,
     config_path: str,
@@ -74,13 +82,15 @@ def prepare_full_structured_data(
     print(f"生成 phenotype_structured.csv: {len(phenotype_structured)} 行, {len(phenotype_structured.columns)} 列")
 
     # 3. 生成 protein_full_structured.csv（包含所有蛋白质列）
-    protein_full_structured = protein_df.copy()
+    protein_cols_only = feature_columns(protein_df)
+    metabolite_cols_only = feature_columns(nmr_df)
+
+    protein_full_structured = protein_df[["eid"] + protein_cols_only].copy()
     protein_output = os.path.join(output_dir, 'protein_full_structured.csv')
     protein_full_structured.to_csv(protein_output, index=False)
     print(f"生成 protein_full_structured.csv: {len(protein_full_structured)} 行, {len(protein_full_structured.columns)} 列")
 
     # 计算蛋白质特征的缺失率统计
-    protein_cols_only = [c for c in protein_df.columns if c != 'eid']
     protein_missing_rates = protein_df[protein_cols_only].isna().mean().sort_values(ascending=False)
     print(f"  蛋白质特征数: {len(protein_cols_only)}")
     print(f"  平均缺失率: {protein_missing_rates.mean():.2%}")
@@ -88,13 +98,12 @@ def prepare_full_structured_data(
     print(f"  缺失率范围: [{protein_missing_rates.min():.2%}, {protein_missing_rates.max():.2%}]")
 
     # 4. 生成 metabolite_full_structured.csv（包含所有代谢物列）
-    metabolite_full_structured = nmr_df.copy()
+    metabolite_full_structured = nmr_df[["eid"] + metabolite_cols_only].copy()
     metabolite_output = os.path.join(output_dir, 'metabolite_full_structured.csv')
     metabolite_full_structured.to_csv(metabolite_output, index=False)
     print(f"生成 metabolite_full_structured.csv: {len(metabolite_full_structured)} 行, {len(metabolite_full_structured.columns)} 列")
 
     # 计算代谢物特征的缺失率统计
-    metabolite_cols_only = [c for c in nmr_df.columns if c != 'eid']
     metabolite_missing_rates = nmr_df[metabolite_cols_only].isna().mean().sort_values(ascending=False)
     print(f"  代谢物特征数: {len(metabolite_cols_only)}")
     print(f"  平均缺失率: {metabolite_missing_rates.mean():.2%}")
@@ -133,4 +142,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

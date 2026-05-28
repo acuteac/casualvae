@@ -1,4 +1,4 @@
-﻿
+
 import argparse
 import json
 import math
@@ -53,6 +53,10 @@ def read_numeric_csv(path: str) -> pd.DataFrame:
     if "eid" not in df.columns:
         raise ValueError(f"{path} must contain an 'eid' column.")
     return df
+
+
+def artifact_feature_cols(cols: List[str]) -> List[str]:
+    return [c for c in cols if c == "index" or c.startswith("Unnamed")]
 
 
 def median_fill_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -724,11 +728,11 @@ def make_dataloaders(dataset: PartialMultiOmicsDataset, cfg: TrainConfig, seed: 
     pair_train, pair_val = split_indices(idx_paired, cfg.val_fraction, seed + 2)
 
     loaders = {
-        "protein_train": DataLoader(Subset(dataset, p_train.tolist()), batch_size=cfg.batch_size, shuffle=True, drop_last=False),
+        "protein_train": DataLoader(Subset(dataset, p_train.tolist()), batch_size=cfg.batch_size, shuffle=True, drop_last=True),
         "protein_val": DataLoader(Subset(dataset, p_val.tolist()), batch_size=cfg.batch_size, shuffle=False, drop_last=False),
-        "metabolite_train": DataLoader(Subset(dataset, m_train.tolist()), batch_size=cfg.batch_size, shuffle=True, drop_last=False),
+        "metabolite_train": DataLoader(Subset(dataset, m_train.tolist()), batch_size=cfg.batch_size, shuffle=True, drop_last=True),
         "metabolite_val": DataLoader(Subset(dataset, m_val.tolist()), batch_size=cfg.batch_size, shuffle=False, drop_last=False),
-        "paired_train": DataLoader(Subset(dataset, pair_train.tolist()), batch_size=cfg.batch_size, shuffle=True, drop_last=False),
+        "paired_train": DataLoader(Subset(dataset, pair_train.tolist()), batch_size=cfg.batch_size, shuffle=True, drop_last=True),
         "paired_val": DataLoader(Subset(dataset, pair_val.tolist()), batch_size=cfg.batch_size, shuffle=False, drop_last=False),
         "all": DataLoader(dataset, batch_size=cfg.batch_size, shuffle=False, drop_last=False),
     }
@@ -921,7 +925,9 @@ def run_pretrain_epoch(
     optimizer: Optional[torch.optim.Optimizer],
 ) -> Dict[str, float]:
     training = optimizer is not None
-    model.train(training)
+    # 始终保持 train 模式以使用 BatchNorm 的 running stats，
+    # 避免小验证集导致 BN 统计量异常
+    model.train(True)
 
     running = {"loss": 0.0, "recon": 0.0, "kl_shared": 0.0, "kl_private": 0.0, "ind": 0.0, "ortho": 0.0}
     n_batches = 0
@@ -938,7 +944,11 @@ def run_pretrain_epoch(
         n_batches += 1
 
     if n_batches == 0:
-        return {k: 0.0 for k in running}
+        if training:
+            raise ValueError("Training dataloader produced no batches.")
+        empty = {k: 0.0 for k in running}
+        empty["loss"] = math.inf
+        return empty
     return {k: v / n_batches for k, v in running.items()}
 
 
@@ -951,7 +961,9 @@ def run_joint_epoch(
     block_sparsity_weights: Dict[str, float],
 ) -> Dict[str, float]:
     training = optimizer is not None
-    model.train(training)
+    # 始终保持 train 模式以使用 BatchNorm 的 running stats，
+    # 避免小验证集导致 BN 统计量异常
+    model.train(True)
 
     running: Dict[str, float] = {
         "loss": 0.0, "recon": 0.0, "recon_p": 0.0, "recon_m": 0.0,
@@ -987,7 +999,11 @@ def run_joint_epoch(
         n_batches += 1
 
     if n_batches == 0:
-        return {k: 0.0 for k in running}
+        if training:
+            raise ValueError("Training dataloader produced no batches.")
+        empty = {k: 0.0 for k in running}
+        empty["loss"] = math.inf
+        return empty
     return {k: v / n_batches for k, v in running.items()}
 
 
@@ -1061,8 +1077,13 @@ def train_model(
         row.update({f"val_{k}": v for k, v in val_metrics.items()})
         history.append(row)
 
-        if val_metrics["loss"] < best_val:
-            best_val = val_metrics["loss"]
+        # 当验证 loss 为 nan/inf 时回退到训练 loss 进行 early stopping
+        current_val = val_metrics["loss"]
+        if not (math.isfinite(current_val)):
+            current_val = train_metrics["loss"]
+
+        if current_val < best_val:
+            best_val = current_val
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             patience = 0
         else:
@@ -1206,20 +1227,29 @@ def extract_outputs(
         pd.DataFrame(g_mo, index=o_feat, columns=m_feat).to_csv(os.path.join(out_dir, "G_metabolite_to_outcome.csv"))
 
     def top_edges(block: np.ndarray, row_names: List[str], col_names: List[str], block_name: str, k: int = 50) -> pd.DataFrame:
-        rows = []
-        for i in range(block.shape[0]):
-            for j in range(block.shape[1]):
-                if row_names is col_names and i == j:
-                    continue
-                rows.append({
-                    "source": col_names[j],
-                    "target": row_names[i],
-                    "edge_weight": float(block[i, j]),
-                    "abs_edge_weight": float(abs(block[i, j])),
-                    "block": block_name,
-                })
-        df = pd.DataFrame(rows).sort_values("abs_edge_weight", ascending=False).head(k).reset_index(drop=True)
-        df.insert(0, "rank", np.arange(1, len(df) + 1))
+        # 向量化实现，避免大矩阵嵌套循环导致 MemoryError
+        abs_block = np.abs(block)
+        same_names = row_names is col_names
+        if same_names:
+            np.fill_diagonal(abs_block, 0.0)
+
+        # 扁平化后取 top-k 索引
+        flat = abs_block.ravel()
+        n = min(k, flat.size)
+        if n == 0:
+            return pd.DataFrame(columns=["rank", "source", "target", "edge_weight", "abs_edge_weight", "block"])
+        top_idx = np.argpartition(flat, -n)[-n:]
+        top_idx = top_idx[np.argsort(flat[top_idx])[::-1]]
+
+        row_idx, col_idx = np.unravel_index(top_idx, block.shape)
+        df = pd.DataFrame({
+            "rank": np.arange(1, n + 1),
+            "source": [col_names[j] for j in col_idx],
+            "target": [row_names[i] for i in row_idx],
+            "edge_weight": block[row_idx, col_idx].astype(float),
+            "abs_edge_weight": abs_block[row_idx, col_idx].astype(float),
+            "block": block_name,
+        })
         return df
 
     top_edges(g_pp, p_feat, p_feat, "protein_to_protein").to_csv(os.path.join(out_dir, "top_edges_protein_to_protein.csv"), index=False)
@@ -1289,9 +1319,13 @@ def load_structured_inputs(args):
     protein_df = read_numeric_csv(args.protein_csv)
     metabolite_df = read_numeric_csv(args.metabolite_csv)
 
+    bad_feature_cols = artifact_feature_cols(config["protein_cols"]) + artifact_feature_cols(config["metabolite_cols"])
+    if bad_feature_cols:
+        raise ValueError(f"Artifact columns leaked into feature config: {bad_feature_cols}")
+
     merged = anchors_df.merge(phenotype_df, on="eid", how="inner") \
-                       .merge(protein_df, on="eid", how="inner") \
-                       .merge(metabolite_df, on="eid", how="inner")
+                       .merge(protein_df, on="eid", how="left") \
+                       .merge(metabolite_df, on="eid", how="left")
 
     dataset = PartialMultiOmicsDataset(
         merged=merged,
