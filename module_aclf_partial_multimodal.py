@@ -729,11 +729,11 @@ def make_dataloaders(dataset: PartialMultiOmicsDataset, cfg: TrainConfig, seed: 
 
     loaders = {
         "protein_train": DataLoader(Subset(dataset, p_train.tolist()), batch_size=cfg.batch_size, shuffle=True, drop_last=True),
-        "protein_val": DataLoader(Subset(dataset, p_val.tolist()), batch_size=cfg.batch_size, shuffle=False, drop_last=True),
+        "protein_val": DataLoader(Subset(dataset, p_val.tolist()), batch_size=cfg.batch_size, shuffle=False, drop_last=False),
         "metabolite_train": DataLoader(Subset(dataset, m_train.tolist()), batch_size=cfg.batch_size, shuffle=True, drop_last=True),
-        "metabolite_val": DataLoader(Subset(dataset, m_val.tolist()), batch_size=cfg.batch_size, shuffle=False, drop_last=True),
+        "metabolite_val": DataLoader(Subset(dataset, m_val.tolist()), batch_size=cfg.batch_size, shuffle=False, drop_last=False),
         "paired_train": DataLoader(Subset(dataset, pair_train.tolist()), batch_size=cfg.batch_size, shuffle=True, drop_last=True),
-        "paired_val": DataLoader(Subset(dataset, pair_val.tolist()), batch_size=cfg.batch_size, shuffle=False, drop_last=True),
+        "paired_val": DataLoader(Subset(dataset, pair_val.tolist()), batch_size=cfg.batch_size, shuffle=False, drop_last=False),
         "all": DataLoader(dataset, batch_size=cfg.batch_size, shuffle=False, drop_last=False),
     }
     split_meta = {
@@ -944,7 +944,11 @@ def run_pretrain_epoch(
         n_batches += 1
 
     if n_batches == 0:
-        return {k: 0.0 for k in running}
+        if training:
+            raise ValueError("Training dataloader produced no batches.")
+        empty = {k: 0.0 for k in running}
+        empty["loss"] = math.inf
+        return empty
     return {k: v / n_batches for k, v in running.items()}
 
 
@@ -995,7 +999,11 @@ def run_joint_epoch(
         n_batches += 1
 
     if n_batches == 0:
-        return {k: 0.0 for k in running}
+        if training:
+            raise ValueError("Training dataloader produced no batches.")
+        empty = {k: 0.0 for k in running}
+        empty["loss"] = math.inf
+        return empty
     return {k: v / n_batches for k, v in running.items()}
 
 
