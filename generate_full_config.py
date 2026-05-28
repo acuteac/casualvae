@@ -5,6 +5,21 @@
 import json
 import os
 
+import pandas as pd
+
+
+def clean_feature_cols(cols):
+    return [c for c in cols if c != "index" and not c.startswith("Unnamed")]
+
+
+def csv_columns(path):
+    return set(pd.read_csv(path, nrows=0).columns)
+
+
+def numeric_columns(path, cols):
+    df = pd.read_csv(path, usecols=[c for c in cols if c in csv_columns(path)], low_memory=False)
+    return [c for c in cols if c in df.columns and pd.api.types.is_numeric_dtype(df[c])]
+
 
 def generate_full_config():
     # 读取原始配置（用于 anchor 和 phenotype）
@@ -23,19 +38,33 @@ def generate_full_config():
     with open(full_feature_path, 'r', encoding='utf-8') as f:
         full_features = json.load(f)
 
+    protein_cols = clean_feature_cols(full_features["protein_cols"])
+    metabolite_cols = clean_feature_cols(full_features["metabolite_cols"])
+    structured_dir = os.path.dirname(full_feature_path)
+    anchor_path = os.path.join(structured_dir, "anchors_structured.csv")
+    anchor_available = csv_columns(anchor_path)
+    phenotype_available = csv_columns(os.path.join(structured_dir, "phenotype_structured.csv"))
+    anchor_cols = numeric_columns(anchor_path, [c for c in original_config["anchor_cols"] if c in anchor_available])
+    phenotype_cont_cols = [
+        c for c in original_config["phenotype_continuous_cols"] if c in phenotype_available
+    ]
+    phenotype_bin_cols = [
+        c for c in original_config.get("phenotype_binary_cols", []) if c in phenotype_available
+    ]
+
     # 构建新配置
     new_config = {
-        "anchor_cols": original_config["anchor_cols"],
-        "phenotype_continuous_cols": original_config["phenotype_continuous_cols"],
-        "phenotype_binary_cols": original_config.get("phenotype_binary_cols", []),
-        "protein_cols": full_features["protein_cols"],
-        "metabolite_cols": full_features["metabolite_cols"],
+        "anchor_cols": anchor_cols,
+        "phenotype_continuous_cols": phenotype_cont_cols,
+        "phenotype_binary_cols": phenotype_bin_cols,
+        "protein_cols": protein_cols,
+        "metabolite_cols": metabolite_cols,
         "protein_availability_threshold": 0.5,
         "metabolite_availability_threshold": 0.5,
         "shared_dims": {
-            "protein": 6,
-            "metabolite": 6,
-            "outcome": 6
+            "protein": 15,
+            "metabolite": 15,
+            "outcome": 3
         },
         "private_dims": {
             "protein": 3,
@@ -49,9 +78,9 @@ def generate_full_config():
         "outcome_hidden_dims": [64, 32],
         "notes": {
             "data_source": "full augmented data (all protein and metabolite features)",
-            "n_protein_features": full_features["n_protein_features"],
-            "n_metabolite_features": full_features["n_metabolite_features"],
-            "storm_liver_proxy_score": "mean of signed standardized clinical markers; higher means worse inflammation/liver injury",
+            "n_protein_features": len(protein_cols),
+            "n_metabolite_features": len(metabolite_cols),
+            "continuous_outcomes": "available continuous clinical markers in phenotype_structured.csv",
             "binary_labels": "auxiliary hepatic failure subtype heads from labels.csv",
             "protein_selection": "all available proteins from augmented data",
             "metabolite_selection": "all available metabolites from augmented data",
