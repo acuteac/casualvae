@@ -1206,7 +1206,6 @@
     "GLA",
     "GLB1",
     "GLI2",
-    "GLIPR1",
     "GLO1",
     "GLOD4",
     "GLP1R",
@@ -3245,7 +3244,7 @@
   ],
   "notes": {
     "data_source": "full augmented data (all protein and metabolite features)",
-    "n_protein_features": 2923,
+    "n_protein_features": 2922,
     "n_metabolite_features": 252,
     "continuous_outcomes": "available continuous clinical markers in phenotype_structured.csv",
     "binary_labels": "auxiliary hepatic failure subtype heads from labels.csv",
