@@ -9,6 +9,9 @@
 import os
 import pandas as pd
 import json
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def to_jsonable_number(value):
@@ -234,9 +237,9 @@ def prepare_full_structured_data(
 
 
 def main():
-    augmented_dir = "d:/working space/casualmodule/casualvae/outputs/augmented"
-    config_path = "d:/working space/casualmodule/aclf_partial_multimodal_bundle/aclf_partial_multimodal_config.json"
-    output_dir = "d:/working space/casualmodule/casualvae/outputs/structured_full"
+    augmented_dir = str(PROJECT_ROOT / "data" / "augmented")
+    config_path = str(PROJECT_ROOT / "configs" / "aclf_full_multimodal_config.json")
+    output_dir = str(PROJECT_ROOT / "data" / "structured_full")
 
     prepare_full_structured_data(augmented_dir, config_path, output_dir)
 

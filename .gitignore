@@ -1,6 +1,12 @@
 .venv/
 __pycache__/
 outputs/
+data/
+artifacts/*
+!artifacts/metadata/
+artifacts/metadata/*
+!artifacts/metadata/ukb_nightingale_biomarker_groups.tsv
+!artifacts/metadata/metabolite_feature_dictionary.csv
 *.pyc
 *.pyo
 .DS_Store

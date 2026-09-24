@@ -3213,6 +3213,8 @@
   ],
   "protein_availability_threshold": 0.5,
   "metabolite_availability_threshold": 0.5,
+  "outcome_exogenous_mode": "zero",
+  "outcome_exogenous_sigma": 1.0,
   "shared_dims": {
     "protein": 15,
     "metabolite": 15,
@@ -3232,16 +3234,8 @@
       256,
       128,
       64
-    ],
-    "outcome": [
-      64,
-      32
     ]
   },
-  "outcome_hidden_dims": [
-    64,
-    32
-  ],
   "notes": {
     "data_source": "full augmented data (all protein and metabolite features)",
     "n_protein_features": 2922,

@@ -30,13 +30,13 @@ from torch.utils.data import DataLoader, Dataset, Subset
 # 3) 蛋白质/代谢物编码器同时接收数值和掩码。
 # 4) 每种组学模态分解为共享因果潜变量 z 和
 #    私有干扰潜变量 s。
-# 5) SCM 仅在共享的蛋白质/代谢物潜变量上学习。
+# 5) SCM 在蛋白质、代谢物和结局共享潜变量上学习；结局外生输入为零或独立噪声。
 # 6) 训练分阶段进行：
 #      阶段 1：在蛋白质可用行上预训练蛋白质自编码器
 #      阶段 2：在代谢物可用行上预训练代谢物自编码器
 #      阶段 3：在配对行上进行联合 SCM 训练
 # 7) 重构采用掩码机制，损失仅在已观测值上计算。
-# 8) 混合表型头同时支持连续型和二分类结局变量。
+# 8) OutcomeDecoder 从结局潜变量预测连续型和二分类结局。
 # ============================================================
 
 
@@ -229,49 +229,6 @@ class LinearSharedPrivateDecoder(nn.Module):
         return self.shared_linear.weight
 
 
-class MixedOutcomeHead(nn.Module):
-    def __init__(self, input_dim: int, n_cont: int, n_bin: int, hidden_dims: List[int]):
-        super().__init__()
-        self.n_cont = n_cont
-        self.n_bin = n_bin
-        total_out = n_cont + n_bin
-        dims = [input_dim] + hidden_dims + [total_out]
-        layers: List[nn.Module] = []
-        for i in range(len(dims) - 2):
-            layers.extend([nn.Linear(dims[i], dims[i + 1]), nn.ReLU(), nn.Dropout(0.1)])
-        layers.append(nn.Linear(dims[-2], dims[-1]))
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        out = self.net(x)
-        cont = out[:, : self.n_cont] if self.n_cont > 0 else out[:, :0]
-        binary = out[:, self.n_cont :] if self.n_bin > 0 else out[:, :0]
-        return cont, binary
-
-
-class OutcomeEncoder(nn.Module):
-    """
-    结局变量编码器（仅共享潜变量，无私有潜变量）
-    将连续型和二分类结局编码为共享潜变量
-    """
-    def __init__(self, n_cont: int, n_bin: int, hidden_dims: List[int], shared_dim: int, dropout: float = 0.1):
-        super().__init__()
-        input_dim = n_cont + n_bin
-        self.backbone = MLP(input_dim, hidden_dims, dropout=dropout)
-        hdim = self.backbone.output_dim
-
-        self.shared_mu = nn.Linear(hdim, shared_dim)
-        self.shared_logvar = nn.Linear(hdim, shared_dim)
-
-    def forward(self, y_cont: torch.Tensor, y_bin: torch.Tensor) -> Dict[str, torch.Tensor]:
-        y_input = torch.cat([y_cont, y_bin], dim=1) if y_cont.numel() > 0 and y_bin.numel() > 0 else (y_cont if y_cont.numel() > 0 else y_bin)
-        h = self.backbone(y_input)
-        return {
-            "shared_mu": self.shared_mu(h),
-            "shared_logvar": self.shared_logvar(h),
-        }
-
-
 class OutcomeDecoder(nn.Module):
     """
     结局变量解码器
@@ -301,9 +258,9 @@ class OutcomeDecoder(nn.Module):
 class BlockSCM(nn.Module):
     """
     共享潜变量结构因果模型 (SCM)：
-        z = (I - A^T)^(-1) (eps + context)
+        z = (I - A)^(-1) (eps + context), where A uses [target, source] indexing.
 
-    全局图 A 包含 6 个子块（如果包含 outcome）：
+    全局图 A 固定包含 protein、metabolite、outcome；主要学习以下 6 类边：
         蛋白质->蛋白质
         代谢物->代谢物
         蛋白质->代谢物
@@ -312,7 +269,7 @@ class BlockSCM(nn.Module):
         代谢物->结局
 
     DAG 惩罚仅在蛋白质和代谢物各自的子块内施加。
-    结局节点作为纯下游节点，不允许从结局指向其他节点。
+    不允许结局指向组学节点；结局块内部非对角边由稀疏惩罚抑制。
     """
 
     def __init__(
@@ -323,23 +280,23 @@ class BlockSCM(nn.Module):
         weight_scale: float = 0.02,
     ):
         super().__init__()
+        outcome_dim = latent_dims.get("outcome")
+        if type(outcome_dim) is not int or outcome_dim <= 0:
+            raise ValueError("latent_dims['outcome'] must be a positive integer")
         self.latent_dims = latent_dims
         self.total_dim = sum(latent_dims.values())
         self.block_slices = self._build_block_slices(latent_dims)
-        self.has_outcome = "outcome" in latent_dims
 
         # 基础掩码：对角线为 0
         mask = np.ones((self.total_dim, self.total_dim), dtype=np.float32)
         np.fill_diagonal(mask, 0.0)
 
-        # 如果包含 outcome，强制 outcome -> protein/metabolite 的边为 0
-        if self.has_outcome:
-            o = self.block_slices["outcome"]
-            p = self.block_slices["protein"]
-            m = self.block_slices["metabolite"]
-            # outcome 不能指向 protein 或 metabolite（行索引为 p/m，列索引为 o）
-            mask[p, o] = 0.0
-            mask[m, o] = 0.0
+        # A 使用 [目标, 来源] 索引，禁止 outcome -> protein/metabolite。
+        o = self.block_slices["outcome"]
+        p = self.block_slices["protein"]
+        m = self.block_slices["metabolite"]
+        mask[p, o] = 0.0
+        mask[m, o] = 0.0
 
         self.register_buffer("mask", torch.tensor(mask, dtype=torch.float32))
         self.register_buffer("eye", torch.eye(self.total_dim, dtype=torch.float32))
@@ -350,11 +307,8 @@ class BlockSCM(nn.Module):
         logits[p, m] = cross_logit_init
         logits[m, p] = cross_logit_init
 
-        # 如果包含 outcome，设置 protein/metabolite -> outcome 的初始 logits
-        if self.has_outcome:
-            o = self.block_slices["outcome"]
-            logits[o, p] = cross_logit_init  # protein -> outcome
-            logits[o, m] = cross_logit_init  # metabolite -> outcome
+        logits[o, p] = cross_logit_init  # protein -> outcome
+        logits[o, m] = cross_logit_init  # metabolite -> outcome
 
         logits.fill_diagonal_(-12.0)
 
@@ -395,7 +349,7 @@ class BlockSCM(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         a = self.adjacency(tau=tau, hard=False, sample_gumbel=True)
         rhs = eps if context is None else eps + context
-        mat = self.eye.to(rhs.device) - a.T
+        mat = self.eye.to(rhs.device) - a
         z = torch.linalg.solve(mat, rhs.T).T
         return z, a
 
@@ -422,10 +376,9 @@ class BlockSCM(nn.Module):
             "metabolite_to_protein": (sl["protein"], sl["metabolite"]),
             "metabolite_to_metabolite": (sl["metabolite"], sl["metabolite"]),
         }
-        if self.has_outcome:
-            block_map["protein_to_outcome"] = (sl["outcome"], sl["protein"])
-            block_map["metabolite_to_outcome"] = (sl["outcome"], sl["metabolite"])
-            block_map["outcome_to_outcome"] = (sl["outcome"], sl["outcome"])
+        block_map["protein_to_outcome"] = (sl["outcome"], sl["protein"])
+        block_map["metabolite_to_outcome"] = (sl["outcome"], sl["metabolite"])
+        block_map["outcome_to_outcome"] = (sl["outcome"], sl["outcome"])
 
         for key, (row_sl, col_sl) in block_map.items():
             coeff = float(block_weights.get(key, 1.0))
@@ -449,10 +402,9 @@ class BlockSCM(nn.Module):
                 "metabolite_to_protein_gate_mean": float(gate[sl["protein"], sl["metabolite"]].mean().item()),
                 "metabolite_to_metabolite_gate_mean": float(gate[sl["metabolite"], sl["metabolite"]].mean().item()),
             }
-            if self.has_outcome:
-                stats["protein_to_outcome_gate_mean"] = float(gate[sl["outcome"], sl["protein"]].mean().item())
-                stats["metabolite_to_outcome_gate_mean"] = float(gate[sl["outcome"], sl["metabolite"]].mean().item())
-                stats["outcome_to_outcome_gate_mean"] = float(gate[sl["outcome"], sl["outcome"]].mean().item())
+            stats["protein_to_outcome_gate_mean"] = float(gate[sl["outcome"], sl["protein"]].mean().item())
+            stats["metabolite_to_outcome_gate_mean"] = float(gate[sl["outcome"], sl["metabolite"]].mean().item())
+            stats["outcome_to_outcome_gate_mean"] = float(gate[sl["outcome"], sl["outcome"]].mean().item())
         return stats
 
 
@@ -463,12 +415,27 @@ class PartialAnchoredCausalVAE(nn.Module):
         shared_dims: Dict[str, int],
         private_dims: Dict[str, int],
         hidden_dims: Dict[str, List[int]],
-        outcome_hidden_dims: List[int],
+        outcome_exogenous_mode: str = "zero",
+        outcome_exogenous_sigma: float = 1.0,
     ):
         super().__init__()
+        outcome_dim = shared_dims.get("outcome")
+        if type(outcome_dim) is not int or outcome_dim <= 0:
+            raise ValueError("shared_dims['outcome'] must be a positive integer")
+        valid_outcome_modes = {"zero", "gaussian"}
+        if outcome_exogenous_mode not in valid_outcome_modes:
+            raise ValueError(
+                "outcome_exogenous_mode must be one of "
+                f"{sorted(valid_outcome_modes)}, got {outcome_exogenous_mode!r}"
+            )
+        if outcome_exogenous_sigma < 0:
+            raise ValueError("outcome_exogenous_sigma must be non-negative")
+
         self.input_dims = input_dims
         self.shared_dims = shared_dims
         self.private_dims = private_dims
+        self.outcome_exogenous_mode = outcome_exogenous_mode
+        self.outcome_exogenous_sigma = float(outcome_exogenous_sigma)
 
         self.enc_p = SharedPrivateEncoder(
             feature_dim=input_dims["protein"],
@@ -483,14 +450,6 @@ class PartialAnchoredCausalVAE(nn.Module):
             private_dim=private_dims["metabolite"],
         )
 
-        # 添加结局编码器（仅共享潜变量）
-        self.enc_outcome = OutcomeEncoder(
-            n_cont=input_dims["y_cont"],
-            n_bin=input_dims["y_bin"],
-            hidden_dims=hidden_dims.get("outcome", [64, 32]),
-            shared_dim=shared_dims.get("outcome", shared_dims["protein"]),  # 默认与 protein 相同
-        )
-
         self.scm = BlockSCM(latent_dims=shared_dims)
 
         total_shared = sum(shared_dims.values())
@@ -501,18 +460,9 @@ class PartialAnchoredCausalVAE(nn.Module):
 
         # 添加结局解码器
         self.dec_outcome = OutcomeDecoder(
-            shared_dim=shared_dims.get("outcome", shared_dims["protein"]),
+            shared_dim=shared_dims["outcome"],
             n_cont=input_dims["y_cont"],
             n_bin=input_dims["y_bin"],
-        )
-
-        # 保留原有的 outcome_head 作为辅助监督（可选）
-        outcome_input_dim = total_shared + input_dims["anchor"] + 4
-        self.outcome_head = MixedOutcomeHead(
-            input_dim=outcome_input_dim,
-            n_cont=input_dims["y_cont"],
-            n_bin=input_dims["y_bin"],
-            hidden_dims=outcome_hidden_dims,
         )
 
     @staticmethod
@@ -540,23 +490,13 @@ class PartialAnchoredCausalVAE(nn.Module):
     def encode_metabolite(self, x_m: torch.Tensor, m_m: torch.Tensor) -> Dict[str, torch.Tensor]:
         return self.encode_modality(self.enc_m, x_m, m_m)
 
-    def encode_outcome(self, y_cont: torch.Tensor, y_bin: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """编码结局变量（仅共享潜变量）"""
-        out = self.enc_outcome(y_cont, y_bin)
-        shared_eps = self.reparameterize(out["shared_mu"], out["shared_logvar"])
-        out["shared_eps"] = shared_eps
-        return out
-
     def get_causal_decoder_projection(self) -> torch.Tensor:
         """获取因果解码器投影矩阵（包含结局）"""
-        if "outcome" in self.shared_dims:
-            return torch.block_diag(
-                self.dec_p.shared_weight,
-                self.dec_m.shared_weight,
-                self.dec_outcome.weight
-            )
-        else:
-            return torch.block_diag(self.dec_p.shared_weight, self.dec_m.shared_weight)
+        return torch.block_diag(
+            self.dec_p.shared_weight,
+            self.dec_m.shared_weight,
+            self.dec_outcome.weight
+        )
 
     def forward_protein_only(self, x_p: torch.Tensor, m_p: torch.Tensor) -> Dict[str, torch.Tensor]:
         enc_p = self.encode_protein(x_p, m_p)
@@ -584,20 +524,30 @@ class PartialAnchoredCausalVAE(nn.Module):
         use_scm: bool,
         tau: float,
     ) -> Dict[str, torch.Tensor]:
+        """Y and observed fractions remain in the call signature for callers; neither is a generative input."""
         enc_p = self.encode_protein(x_p, m_p)
         enc_m = self.encode_metabolite(x_m, m_m)
-        enc_outcome = self.encode_outcome(y_cont, y_bin)
-
-        # 拼接所有模态的共享潜变量
         eps_parts = [enc_p["shared_eps"] * avail_p, enc_m["shared_eps"] * avail_m]
-        if "outcome" in self.shared_dims:
-            eps_parts.append(enc_outcome["shared_eps"])
+        outcome_dim = self.shared_dims["outcome"]
+        if self.outcome_exogenous_mode == "gaussian":
+            eps_outcome = torch.randn(
+                x_p.shape[0], outcome_dim, device=x_p.device, dtype=x_p.dtype
+            ) * self.outcome_exogenous_sigma
+        else:
+            eps_outcome = torch.zeros(
+                x_p.shape[0], outcome_dim, device=x_p.device, dtype=x_p.dtype
+            )
+        eps_parts.append(eps_outcome)
         eps_shared = torch.cat(eps_parts, dim=1)
 
         context = self.anchor_to_context(u) if self.anchor_to_context is not None else None
 
         if use_scm:
-            z_all, a = self.scm(eps_shared, context=context, tau=tau)
+            z_all, a = self.scm(
+                eps_shared,
+                context=context,
+                tau=tau,
+            )
         else:
             z_all = eps_shared if context is None else eps_shared + context
             a = self.scm.adjacency(tau=tau, hard=False, sample_gumbel=False)
@@ -607,25 +557,16 @@ class PartialAnchoredCausalVAE(nn.Module):
         z_p = z_all[:, :dp] * avail_p
         z_m = z_all[:, dp : dp + dm] * avail_m
 
-        z_outcome = None
-        if "outcome" in self.shared_dims:
-            do = self.shared_dims["outcome"]
-            z_outcome = z_all[:, dp + dm : dp + dm + do]
+        z_outcome = z_all[:, dp + dm : dp + dm + outcome_dim]
 
         xhat_p = self.dec_p(z_p, enc_p["private"])
         xhat_m = self.dec_m(z_m, enc_m["private"])
 
-        # 优先使用因果图中的 outcome 潜变量解码
-        if z_outcome is not None:
-            y_cont_hat, y_bin_logits = self.dec_outcome(z_outcome)
-        else:
-            outcome_input = torch.cat([z_p, z_m, u, avail_p, avail_m, frac_p, frac_m], dim=1)
-            y_cont_hat, y_bin_logits = self.outcome_head(outcome_input)
+        y_cont_hat, y_bin_logits = self.dec_outcome(z_outcome)
 
         return {
             "enc_p": enc_p,
             "enc_m": enc_m,
-            "enc_outcome": enc_outcome,
             "z_all": z_all,
             "z_p": z_p,
             "z_m": z_m,
@@ -717,26 +658,51 @@ def decoder_sparsity_penalty(model: PartialAnchoredCausalVAE) -> torch.Tensor:
     return torch.abs(model.dec_p.shared_weight).sum() + torch.abs(model.dec_m.shared_weight).sum()
 
 
-def make_dataloaders(dataset: PartialMultiOmicsDataset, cfg: TrainConfig, seed: int):
+def make_dataloaders(
+    dataset: PartialMultiOmicsDataset,
+    cfg: TrainConfig,
+    split_seed: int = 42,
+    model_seed: Optional[int] = None,
+):
+    if model_seed is None:
+        model_seed = split_seed
+
     idx_all = np.arange(len(dataset))
     idx_protein = idx_all[dataset.avail_p[:, 0] > 0.5]
     idx_metabolite = idx_all[dataset.avail_m[:, 0] > 0.5]
     idx_paired = idx_all[dataset.paired[:, 0] > 0.5]
 
-    p_train, p_val = split_indices(idx_protein, cfg.val_fraction, seed)
-    m_train, m_val = split_indices(idx_metabolite, cfg.val_fraction, seed + 1)
-    pair_train, pair_val = split_indices(idx_paired, cfg.val_fraction, seed + 2)
+    p_train, p_val = split_indices(idx_protein, cfg.val_fraction, split_seed)
+    m_train, m_val = split_indices(idx_metabolite, cfg.val_fraction, split_seed + 1)
+    pair_train, pair_val = split_indices(idx_paired, cfg.val_fraction, split_seed + 2)
+
+    def train_loader(indices: np.ndarray, stream_offset: int) -> DataLoader:
+        generator = torch.Generator()
+        generator.manual_seed(int(model_seed) + stream_offset)
+        return DataLoader(
+            Subset(dataset, indices.tolist()),
+            batch_size=cfg.batch_size,
+            shuffle=True,
+            drop_last=True,
+            generator=generator,
+        )
 
     loaders = {
-        "protein_train": DataLoader(Subset(dataset, p_train.tolist()), batch_size=cfg.batch_size, shuffle=True, drop_last=True),
+        "protein_train": train_loader(p_train, 0),
         "protein_val": DataLoader(Subset(dataset, p_val.tolist()), batch_size=cfg.batch_size, shuffle=False, drop_last=False),
-        "metabolite_train": DataLoader(Subset(dataset, m_train.tolist()), batch_size=cfg.batch_size, shuffle=True, drop_last=True),
+        "metabolite_train": train_loader(m_train, 1),
         "metabolite_val": DataLoader(Subset(dataset, m_val.tolist()), batch_size=cfg.batch_size, shuffle=False, drop_last=False),
-        "paired_train": DataLoader(Subset(dataset, pair_train.tolist()), batch_size=cfg.batch_size, shuffle=True, drop_last=True),
+        "paired_train": train_loader(pair_train, 2),
         "paired_val": DataLoader(Subset(dataset, pair_val.tolist()), batch_size=cfg.batch_size, shuffle=False, drop_last=False),
         "all": DataLoader(dataset, batch_size=cfg.batch_size, shuffle=False, drop_last=False),
     }
+
+    def eids(indices: np.ndarray) -> List[int]:
+        return dataset.eids[indices].astype(np.int64).tolist()
+
     split_meta = {
+        "split_seed": int(split_seed),
+        "model_seed": int(model_seed),
         "n_total": int(len(dataset)),
         "n_protein_available": int(len(idx_protein)),
         "n_metabolite_available": int(len(idx_metabolite)),
@@ -747,6 +713,12 @@ def make_dataloaders(dataset: PartialMultiOmicsDataset, cfg: TrainConfig, seed: 
         "n_metabolite_val": int(len(m_val)),
         "n_paired_train": int(len(pair_train)),
         "n_paired_val": int(len(pair_val)),
+        "protein_train_eids": eids(p_train),
+        "protein_val_eids": eids(p_val),
+        "metabolite_train_eids": eids(m_train),
+        "metabolite_val_eids": eids(m_val),
+        "paired_train_eids": eids(pair_train),
+        "paired_val_eids": eids(pair_val),
     }
     return loaders, split_meta
 
@@ -842,10 +814,6 @@ def joint_loss(
     kl_shared = kl_normal(out["enc_p"]["shared_mu"], out["enc_p"]["shared_logvar"]) + kl_normal(
         out["enc_m"]["shared_mu"], out["enc_m"]["shared_logvar"]
     )
-    # 添加结局 KL 散度
-    if "enc_outcome" in out and out["enc_outcome"] is not None:
-        kl_shared = kl_shared + kl_normal(out["enc_outcome"]["shared_mu"], out["enc_outcome"]["shared_logvar"])
-
     kl_private = kl_normal(out["enc_p"]["private_mu"], out["enc_p"]["private_logvar"]) + kl_normal(
         out["enc_m"]["private_mu"], out["enc_m"]["private_logvar"]
     )
@@ -861,14 +829,10 @@ def joint_loss(
     stable = model.scm.spectral_radius_penalty(tau=tau) if use_scm else torch.tensor(0.0, device=cfg.device)
 
     ortho = orthogonality_penalty(model.dec_p.shared_weight) + orthogonality_penalty(model.dec_m.shared_weight)
-    # 添加结局解码器的正交性惩罚
-    if "outcome" in model.shared_dims:
-        ortho = ortho + orthogonality_penalty(model.dec_outcome.weight)
+    ortho = ortho + orthogonality_penalty(model.dec_outcome.weight)
 
     dec_sparse = decoder_sparsity_penalty(model)
-    # 添加结局解码器的稀疏性惩罚
-    if "outcome" in model.shared_dims:
-        dec_sparse = dec_sparse + torch.abs(model.dec_outcome.weight).sum()
+    dec_sparse = dec_sparse + torch.abs(model.dec_outcome.weight).sum()
 
     cont_loss = F.mse_loss(out["y_cont_hat"], y_cont) if y_cont.numel() > 0 else torch.tensor(0.0, device=cfg.device)
     bin_loss = F.binary_cross_entropy_with_logits(out["y_bin_logits"], y_bin) if y_bin.numel() > 0 else torch.tensor(0.0, device=cfg.device)
@@ -925,16 +889,20 @@ def run_pretrain_epoch(
     optimizer: Optional[torch.optim.Optimizer],
 ) -> Dict[str, float]:
     training = optimizer is not None
-    # 始终保持 train 模式以使用 BatchNorm 的 running stats，
-    # 避免小验证集导致 BN 统计量异常
-    model.train(True)
+    if training:
+        model.train()
+    else:
+        model.eval()
 
     running = {"loss": 0.0, "recon": 0.0, "kl_shared": 0.0, "kl_private": 0.0, "ind": 0.0, "ortho": 0.0}
     n_batches = 0
     for batch in loader:
         if training:
             optimizer.zero_grad()
-        loss, scalars = modality_pretrain_loss(model, batch, modality, cfg)
+            loss, scalars = modality_pretrain_loss(model, batch, modality, cfg)
+        else:
+            with torch.no_grad():
+                loss, scalars = modality_pretrain_loss(model, batch, modality, cfg)
         if training:
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
@@ -961,9 +929,10 @@ def run_joint_epoch(
     block_sparsity_weights: Dict[str, float],
 ) -> Dict[str, float]:
     training = optimizer is not None
-    # 始终保持 train 模式以使用 BatchNorm 的 running stats，
-    # 避免小验证集导致 BN 统计量异常
-    model.train(True)
+    if training:
+        model.train()
+    else:
+        model.eval()
 
     running: Dict[str, float] = {
         "loss": 0.0, "recon": 0.0, "recon_p": 0.0, "recon_m": 0.0,
@@ -977,18 +946,19 @@ def run_joint_epoch(
         "metabolite_to_protein_gate_mean": 0.0,
         "metabolite_to_metabolite_gate_mean": 0.0,
     }
-    # 如果模型包含 outcome，添加对应的 gate stats 键
-    if "outcome" in model.shared_dims:
-        running["protein_to_outcome_gate_mean"] = 0.0
-        running["metabolite_to_outcome_gate_mean"] = 0.0
-        running["outcome_to_outcome_gate_mean"] = 0.0
+    running["protein_to_outcome_gate_mean"] = 0.0
+    running["metabolite_to_outcome_gate_mean"] = 0.0
+    running["outcome_to_outcome_gate_mean"] = 0.0
 
     n_batches = 0
 
     for batch in loader:
         if training:
             optimizer.zero_grad()
-        loss, scalars = joint_loss(model, batch, cfg, epoch, block_sparsity_weights)
+            loss, scalars = joint_loss(model, batch, cfg, epoch, block_sparsity_weights)
+        else:
+            with torch.no_grad():
+                loss, scalars = joint_loss(model, batch, cfg, epoch, block_sparsity_weights)
         if training:
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
@@ -1011,7 +981,7 @@ def train_model(
     model: PartialAnchoredCausalVAE,
     loaders: Dict[str, DataLoader],
     cfg: TrainConfig,
-) -> List[Dict[str, float]]:
+) -> Tuple[List[Dict[str, float]], int, float]:
     history: List[Dict[str, float]] = []
     model.to(cfg.device)
 
@@ -1023,8 +993,7 @@ def train_model(
     )
     for epoch in range(cfg.pretrain_protein_epochs):
         train_metrics = run_pretrain_epoch(model, loaders["protein_train"], "protein", cfg, opt_p)
-        with torch.no_grad():
-            val_metrics = run_pretrain_epoch(model, loaders["protein_val"], "protein", cfg, None)
+        val_metrics = run_pretrain_epoch(model, loaders["protein_val"], "protein", cfg, None)
         row = {"stage": "pretrain_protein", "epoch": epoch + 1}
         row.update({f"train_{k}": v for k, v in train_metrics.items()})
         row.update({f"val_{k}": v for k, v in val_metrics.items()})
@@ -1040,8 +1009,7 @@ def train_model(
     )
     for epoch in range(cfg.pretrain_metabolite_epochs):
         train_metrics = run_pretrain_epoch(model, loaders["metabolite_train"], "metabolite", cfg, opt_m)
-        with torch.no_grad():
-            val_metrics = run_pretrain_epoch(model, loaders["metabolite_val"], "metabolite", cfg, None)
+        val_metrics = run_pretrain_epoch(model, loaders["metabolite_val"], "metabolite", cfg, None)
         row = {"stage": "pretrain_metabolite", "epoch": epoch + 1}
         row.update({f"train_{k}": v for k, v in train_metrics.items()})
         row.update({f"val_{k}": v for k, v in val_metrics.items()})
@@ -1057,20 +1025,19 @@ def train_model(
         "protein_to_metabolite": 0.35,
         "metabolite_to_protein": 0.35,
     }
-    # 如果模型包含 outcome 节点，添加对应的稀疏性权重
-    if "outcome" in model.shared_dims:
-        block_sparsity_weights["protein_to_outcome"] = 0.5
-        block_sparsity_weights["metabolite_to_outcome"] = 0.5
-        block_sparsity_weights["outcome_to_outcome"] = 999.0
+    block_sparsity_weights["protein_to_outcome"] = 0.5
+    block_sparsity_weights["metabolite_to_outcome"] = 0.5
+    block_sparsity_weights["outcome_to_outcome"] = 999.0
 
     best_state = None
     best_val = float("inf")
+    best_epoch = 0
+    best_tau = float(cfg.tau_end)
     patience = 0
 
     for epoch in range(cfg.joint_epochs):
         train_metrics = run_joint_epoch(model, loaders["paired_train"], cfg, opt_joint, epoch, block_sparsity_weights)
-        with torch.no_grad():
-            val_metrics = run_joint_epoch(model, loaders["paired_val"], cfg, None, epoch, block_sparsity_weights)
+        val_metrics = run_joint_epoch(model, loaders["paired_val"], cfg, None, epoch, block_sparsity_weights)
 
         row = {"stage": "joint", "epoch": epoch + 1}
         row.update({f"train_{k}": v for k, v in train_metrics.items()})
@@ -1079,13 +1046,17 @@ def train_model(
 
         # 当验证 loss 为 nan/inf 时回退到训练 loss 进行 early stopping
         current_val = val_metrics["loss"]
+        current_tau = val_metrics["tau"]
         if not (math.isfinite(current_val)):
             current_val = train_metrics["loss"]
+            current_tau = train_metrics["tau"]
 
         if current_val < best_val:
             best_val = current_val
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             patience = 0
+            best_epoch = epoch + 1
+            best_tau = float(current_tau)
         else:
             patience += 1
 
@@ -1105,7 +1076,7 @@ def train_model(
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    return history
+    return history, best_epoch, best_tau
 
 
 @torch.no_grad()
@@ -1115,6 +1086,10 @@ def extract_outputs(
     loader: DataLoader,
     out_dir: str,
     tau: float,
+    best_epoch: Optional[int] = None,
+    best_tau: Optional[float] = None,
+    split_seed: Optional[int] = None,
+    model_seed: Optional[int] = None,
 ) -> None:
     os.makedirs(out_dir, exist_ok=True)
     model.eval()
@@ -1163,8 +1138,7 @@ def extract_outputs(
 
     latent = np.concatenate(z_list, axis=0)
     latent_col_names = [f"P{i+1}" for i in range(model.shared_dims["protein"])] + [f"M{i+1}" for i in range(model.shared_dims["metabolite"])]
-    if "outcome" in model.shared_dims:
-        latent_col_names += [f"O{i+1}" for i in range(model.shared_dims["outcome"])]
+    latent_col_names += [f"O{i+1}" for i in range(model.shared_dims["outcome"])]
     pd.DataFrame(latent, columns=latent_col_names).to_csv(
         os.path.join(out_dir, "shared_latent_z.csv"), index=False
     )
@@ -1186,10 +1160,9 @@ def extract_outputs(
     g = d @ a @ d.T
 
     shared_names = [f"P{i+1}" for i in range(model.shared_dims["protein"])] + [f"M{i+1}" for i in range(model.shared_dims["metabolite"])]
-    if "outcome" in model.shared_dims:
-        shared_names += [f"O{i+1}" for i in range(model.shared_dims["outcome"])]
+    shared_names += [f"O{i+1}" for i in range(model.shared_dims["outcome"])]
 
-    outcome_feature_names = dataset.phenotype_cont_cols + dataset.phenotype_bin_cols if "outcome" in model.shared_dims else []
+    outcome_feature_names = dataset.phenotype_cont_cols + dataset.phenotype_bin_cols
     feature_names = dataset.protein_cols + dataset.metabolite_cols + outcome_feature_names
 
     pd.DataFrame(a, index=shared_names, columns=shared_names).to_csv(
@@ -1274,6 +1247,12 @@ def extract_outputs(
         "paired_available_ge_threshold": int((dataset.paired[:, 0] > 0.5).sum()),
         "shared_dims": model.shared_dims,
         "private_dims": model.private_dims,
+        "outcome_exogenous_mode": model.outcome_exogenous_mode,
+        "outcome_exogenous_sigma": model.outcome_exogenous_sigma,
+        "best_epoch": int(best_epoch) if best_epoch is not None else None,
+        "best_tau": float(best_tau) if best_tau is not None else float(tau),
+        "split_seed": int(split_seed) if split_seed is not None else None,
+        "model_seed": int(model_seed) if model_seed is not None else None,
     }
     with open(os.path.join(out_dir, "run_summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
@@ -1287,7 +1266,14 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--metabolite_csv", type=str, required=True)
     parser.add_argument("--config_json", type=str, required=True)
     parser.add_argument("--out_dir", type=str, required=True)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--split_seed", "--split-seed", dest="split_seed", type=int, default=42)
+    parser.add_argument("--model_seed", "--model-seed", dest="model_seed", type=int, default=42)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Legacy option: set both split_seed and model_seed to the same value.",
+    )
 
     parser.add_argument("--shared_p", type=int, default=6)
     parser.add_argument("--shared_m", type=int, default=6)
@@ -1345,7 +1331,9 @@ def main():
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
-    set_seed(args.seed)
+    split_seed = args.seed if args.seed is not None else args.split_seed
+    model_seed = args.seed if args.seed is not None else args.model_seed
+    set_seed(model_seed)
 
     dataset, config = load_structured_inputs(args)
     cfg = TrainConfig(
@@ -1364,7 +1352,12 @@ def main():
         tau_end=args.tau_end,
     )
 
-    loaders, split_meta = make_dataloaders(dataset, cfg, args.seed)
+    loaders, split_meta = make_dataloaders(
+        dataset,
+        cfg,
+        split_seed=split_seed,
+        model_seed=model_seed,
+    )
 
     input_dims = {
         "anchor": len(dataset.anchor_cols),
@@ -1377,9 +1370,10 @@ def main():
         "protein": int(config.get("shared_dims", {}).get("protein", args.shared_p)),
         "metabolite": int(config.get("shared_dims", {}).get("metabolite", args.shared_m)),
     }
-    # 如果配置中包含 outcome 共享维度，则添加到 shared_dims
-    if config.get("shared_dims", {}).get("outcome"):
-        shared_dims["outcome"] = int(config["shared_dims"]["outcome"])
+    outcome_dim = config.get("shared_dims", {}).get("outcome")
+    if type(outcome_dim) is not int or outcome_dim <= 0:
+        raise ValueError("config shared_dims['outcome'] must be a positive integer")
+    shared_dims["outcome"] = outcome_dim
     private_dims = {
         "protein": int(config.get("private_dims", {}).get("protein", args.private_p)),
         "metabolite": int(config.get("private_dims", {}).get("metabolite", args.private_m)),
@@ -1391,17 +1385,20 @@ def main():
             "metabolite": [128, 64],
         },
     )
-    outcome_hidden_dims = config.get("outcome_hidden_dims", [64, 32])
 
     model = PartialAnchoredCausalVAE(
         input_dims=input_dims,
         shared_dims=shared_dims,
         private_dims=private_dims,
         hidden_dims=hidden_dims,
-        outcome_hidden_dims=outcome_hidden_dims,
+        outcome_exogenous_mode=str(config.get("outcome_exogenous_mode", "zero")),
+        outcome_exogenous_sigma=float(config.get("outcome_exogenous_sigma", 1.0)),
     )
 
-    history = train_model(model, loaders, cfg)
+    config["outcome_exogenous_mode"] = model.outcome_exogenous_mode
+    config["outcome_exogenous_sigma"] = model.outcome_exogenous_sigma
+
+    history, best_epoch, best_tau = train_model(model, loaders, cfg)
     pd.DataFrame(history).to_csv(os.path.join(args.out_dir, "training_history.csv"), index=False)
     torch.save(model.state_dict(), os.path.join(args.out_dir, "model.pt"))
 
@@ -1410,7 +1407,11 @@ def main():
         dataset=dataset,
         loader=loaders["all"],
         out_dir=args.out_dir,
-        tau=cfg.tau_end,
+        tau=best_tau,
+        best_epoch=best_epoch,
+        best_tau=best_tau,
+        split_seed=split_seed,
+        model_seed=model_seed,
     )
 
     with open(os.path.join(args.out_dir, "data_split_summary.json"), "w", encoding="utf-8") as f:

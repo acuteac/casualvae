@@ -4,8 +4,11 @@
 
 import json
 import os
+from pathlib import Path
 
 import pandas as pd
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def clean_feature_cols(cols):
@@ -23,12 +26,12 @@ def numeric_columns(path, cols):
 
 def generate_full_config():
     # 读取原始配置（用于 anchor 和 phenotype）
-    original_config_path = "d:/working space/casualmodule/aclf_partial_multimodal_bundle/aclf_partial_multimodal_config.json"
+    original_config_path = PROJECT_ROOT / "configs" / "aclf_full_multimodal_config.json"
     with open(original_config_path, 'r', encoding='utf-8') as f:
         original_config = json.load(f)
 
     # 读取完整特征列名（由 prepare_full_augmented_structured.py 生成）
-    full_feature_path = "d:/working space/casualmodule/casualvae/outputs/structured_full/full_feature_columns.json"
+    full_feature_path = PROJECT_ROOT / "data" / "structured_full" / "full_feature_columns.json"
 
     if not os.path.exists(full_feature_path):
         print(f"错误：未找到 {full_feature_path}")
@@ -61,6 +64,8 @@ def generate_full_config():
         "metabolite_cols": metabolite_cols,
         "protein_availability_threshold": 0.5,
         "metabolite_availability_threshold": 0.5,
+        "outcome_exogenous_mode": "zero",
+        "outcome_exogenous_sigma": 1.0,
         "shared_dims": {
             "protein": 15,
             "metabolite": 15,
@@ -72,10 +77,8 @@ def generate_full_config():
         },
         "hidden_dims": {
             "protein": [512, 256, 128],
-            "metabolite": [256, 128, 64],
-            "outcome": [64, 32]
+            "metabolite": [256, 128, 64]
         },
-        "outcome_hidden_dims": [64, 32],
         "notes": {
             "data_source": "full augmented data (all protein and metabolite features)",
             "n_protein_features": len(protein_cols),
@@ -89,7 +92,7 @@ def generate_full_config():
     }
 
     # 保存新配置
-    output_path = "d:/working space/casualmodule/casualvae/aclf_full_multimodal_config.json"
+    output_path = PROJECT_ROOT / "configs" / "aclf_full_multimodal_config.json"
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(new_config, f, ensure_ascii=False, indent=2)
 

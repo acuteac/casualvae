@@ -7,7 +7,10 @@ import os
 import numpy as np
 import pandas as pd
 import warnings
+from pathlib import Path
 warnings.filterwarnings('ignore')
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def get_continuous_cols(df: pd.DataFrame, exclude_cols: list) -> list:
@@ -94,8 +97,8 @@ def augment_file(input_path: str, output_path: str, seed: int = 42):
 
 
 def main():
-    input_dir  = "D:/working space/casualmodule/casualvae/outputs/extract"
-    output_dir = "D:/working space/casualmodule/casualvae/outputs/augmented"
+    input_dir = str(PROJECT_ROOT / "data" / "raw" / "extract")
+    output_dir = str(PROJECT_ROOT / "data" / "augmented")
     os.makedirs(output_dir, exist_ok=True)
 
     files = [
