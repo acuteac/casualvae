@@ -11,3 +11,4 @@ artifacts/metadata/*
 *.pyo
 .DS_Store
 .vscode/
+~$*

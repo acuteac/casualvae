@@ -260,6 +260,14 @@ Tier 分层。
 `artifacts/metadata/metabolite_feature_dictionary.csv` 连接，无需再单独执行注释步骤；
 原始 `feature_code` 仍作为唯一键保留。
 
+## 4.4.1 虚拟扰动候选与实验方案准备
+
+运行 `conda run --no-capture-output -n casualvae_01 python scripts/analysis/prepare_virtual_perturbation.py --dry-run`
+检查现有 4.2/4.3、结构化输入、四模型配置与六组患者 EID 划分；去掉 `--dry-run` 才会在
+`artifacts/analysis/virtual_perturbation/phase1/` 发布正式候选、队列、剂量清单及配置。
+缺失历史 EID 划分时明确报错，不推测患者，也不执行模型预测。规则、CLI、全部字段和第二阶段读取约定见
+[4.4.1 使用文档](docs/virtual_perturbation_phase1.md)。
+
 ## 训练输出
 
 训练输出目录通常包含：
